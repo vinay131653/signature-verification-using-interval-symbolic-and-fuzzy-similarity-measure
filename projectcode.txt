@@ -1,0 +1,245 @@
+from google.colab import files
+uploaded = files.upload()  # This will open a file picker to upload archive.zip
+
+uploaded.keys()
+
+import zipfile, os
+
+# Get the uploaded filename automatically
+zip_filename = list(uploaded.keys())[0]
+extract_folder = '/content/data/'
+os.makedirs(extract_folder, exist_ok=True)
+
+with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+    zip_ref.extractall(extract_folder)
+
+print("Extraction completed!")
+print("Extracted to:", os.path.abspath(extract_folder))
+
+import os
+
+if os.path.exists(zip_filename):
+    print("File found, proceeding to extract...")
+else:
+    print("File not found! Please upload it.")
+
+import cv2
+import numpy as np
+import glob
+import os
+from skimage.feature import local_binary_pattern
+
+# ======================================================
+# PARAMETERS
+# ======================================================
+BLOCK_SIZE = 2
+LAMBDA = 4
+EPS = 1e-9
+
+# LBP parameters
+P1, R1 = 8, 1
+P2, R2 = 16, 2
+UB_BINS = 59
+
+# ======================================================
+# UTILS (RECURSIVE IMAGE LOADING)
+# ======================================================
+def get_images(folder):
+    exts = ("*.png", "*.PNG", "*.jpg", "*.JPG", "*.jpeg", "*.JPEG")
+    files = []
+    for root, _, _ in os.walk(folder):
+        for e in exts:
+            files.extend(glob.glob(os.path.join(root, e)))
+    return sorted(files)
+
+
+# ======================================================
+# PREPROCESSING
+# ======================================================
+def preprocess_image(path):
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise ValueError(f"Cannot read image: {path}")
+
+    _, img = cv2.threshold(img, 0, 255,
+                            cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    img = cv2.medianBlur(img, 3)
+
+    coords = cv2.findNonZero(255 - img)
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        img = img[y:y+h, x:x+w]
+
+    img = cv2.resize(img, (256, 128))
+    return img
+
+# ======================================================
+# UNDER-SAMPLED BITMAP
+# ======================================================
+def undersample(img):
+    h, w = img.shape
+    h = (h // BLOCK_SIZE) * BLOCK_SIZE
+    w = (w // BLOCK_SIZE) * BLOCK_SIZE
+    img = img[:h, :w]
+
+    H, W = h // BLOCK_SIZE, w // BLOCK_SIZE
+    out = np.zeros((H, W), dtype=np.float32)
+
+    for i in range(H):
+        for j in range(W):
+            block = img[i*BLOCK_SIZE:(i+1)*BLOCK_SIZE,
+                        j*BLOCK_SIZE:(j+1)*BLOCK_SIZE]
+            out[i, j] = np.sum(block == 0)
+
+    out = (out / (BLOCK_SIZE**2)) * 255
+    return out.astype(np.uint8)
+
+# ======================================================
+# FEATURE EXTRACTION (87-D)
+# ======================================================
+def extract_features(img):
+    us = undersample(img)
+    ub_lbp = local_binary_pattern(us, P1, R1, method="uniform")
+    ub_hist, _ = np.histogram(
+        ub_lbp.ravel(), bins=UB_BINS, range=(0, UB_BINS), density=True
+    )
+
+    lbp_8 = local_binary_pattern(img, P1, R1, method="uniform")
+    h8, _ = np.histogram(
+        lbp_8.ravel(), bins=P1+2, range=(0, P1+2), density=True
+    )
+
+    lbp_16 = local_binary_pattern(img, P2, R2, method="uniform")
+    h16, _ = np.histogram(
+        lbp_16.ravel(), bins=P2+2, range=(0, P2+2), density=True
+    )
+
+    return np.concatenate([ub_hist, h8, h16])
+
+# ======================================================
+# INTERVAL SYMBOLIC MODEL
+# ======================================================
+def build_model(features):
+    features = np.array(features)
+    m = np.median(features, axis=0)
+    s = np.std(features, axis=0)
+    return {
+        "m": m,
+        "s": s,
+        "f_minus": m - LAMBDA * s,
+        "f_plus":  m + LAMBDA * s
+    }
+
+# ======================================================
+# FUZZY SIMILARITY MEASURE
+# ======================================================
+def fuzzy_similarity(ft, model):
+    m, s = model["m"], model["s"]
+    f_minus, f_plus = model["f_minus"], model["f_plus"]
+    s = np.maximum(s, EPS)
+
+    core_low = m - s
+    core_high = m + s
+    rho = np.zeros_like(ft)
+
+    rho[(ft >= core_low) & (ft <= core_high)] = 1.0
+
+    idx = (ft >= f_minus) & (ft < core_low)
+    rho[idx] = (ft[idx] - f_minus[idx]) / \
+               (core_low[idx] - f_minus[idx] + EPS)
+
+    idx = (ft > core_high) & (ft <= f_plus)
+    rho[idx] = (f_plus[idx] - ft[idx]) / \
+               (f_plus[idx] - core_high[idx] + EPS)
+
+    return np.mean(rho)
+
+# ======================================================
+# TRAINING
+# ======================================================
+def train_user(folder):
+    print("\n[TRAINING PHASE]")
+    files = get_images(folder)
+
+    if len(files) == 0:
+        raise RuntimeError(f"No training images found in {folder}")
+
+    features = []
+    for f in files:
+        img = preprocess_image(f)
+        features.append(extract_features(img))
+
+    model = build_model(features)
+
+    sims = []
+    print("\nTraining similarity scores:")
+    for f, ft in zip(files, features):
+        sim = fuzzy_similarity(ft, model)
+        sims.append(sim)
+        print(f"  {os.path.basename(f):25s} -> {sim:.4f}")
+
+    mean_sim = np.mean(sims)
+    std_sim = np.std(sims)
+    threshold = max(mean_sim - std_sim, 0.0)
+
+    print(f"\nAdaptive threshold θ = {threshold:.4f}")
+    return model, threshold
+
+# ======================================================
+# VERIFICATION
+# ======================================================
+def verify(path, model, threshold):
+    img = preprocess_image(path)
+    ft = extract_features(img)
+    score = fuzzy_similarity(ft, model)
+    label = "Genuine" if score >= threshold else "Forged"
+    return label, score
+
+# ======================================================
+# EVALUATION
+# ======================================================
+def evaluate_system(genuine_train, genuine_test, forgery_test):
+    print("Training images :", len(get_images(genuine_train)))
+    print("Genuine test    :", len(get_images(genuine_test)))
+    print("Forgery test    :", len(get_images(forgery_test)))
+
+    model, threshold = train_user(genuine_train)
+
+    GG = FG = GF = FF = 0
+
+    print("\n[GENUINE TEST SAMPLES]")
+    for f in get_images(genuine_test):
+        label, score = verify(f, model, threshold)
+        print(f"  {os.path.basename(f):25s} -> {label:7s} | {score:.4f}")
+        GG += (label == "Genuine")
+        FG += (label == "Forged")
+
+    print("\n[FORGERY TEST SAMPLES]")
+    for f in get_images(forgery_test):
+        label, score = verify(f, model, threshold)
+        print(f"  {os.path.basename(f):25s} -> {label:7s} | {score:.4f}")
+        GF += (label == "Genuine")
+        FF += (label == "Forged")
+
+    FRR = FG / (GG + FG) if (GG + FG) else 0
+    FAR = GF / (FF + GF) if (FF + GF) else 0
+    AER = (FAR + FRR) / 2
+
+    print("\n[FINAL METRICS]")
+    print(f"FRR : {FRR*100:.2f}%")
+    print(f"FAR : {FAR*100:.2f}%")
+    print(f"AER : {AER*100:.2f}%")
+
+# ======================================================
+# RUN
+# ======================================================
+if __name__ == "__main__":
+    writers = ["writer1", "writer2", "writer3", "writer4"]
+
+for writer in writers:
+    print(f"\n===== Evaluating {writer} =====")
+    genuine_train = f"/content/data/{writer}/train"
+    genuine_test  = f"/content/data/{writer}/genuine_test"
+    forgery_test  = f"/content/data/{writer}/forgery_test"
+
+    evaluate_system(genuine_train, genuine_test, forgery_test)
